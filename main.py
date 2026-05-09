@@ -4,6 +4,7 @@ import requests
 import yfinance as yf
 import numpy as np
 from datetime import datetime
+import pytz
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -18,6 +19,7 @@ TARGET_VOL = 0.80
 LOOKBACK_VOL = 20
 
 current_holding = SAFE
+daily_initialized = False
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -26,7 +28,7 @@ def send_telegram(message):
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
         time.sleep(1)
 
-def alpaca_request(method, endpoint, data=None):
+def alpaca_request(method, endpoint, data=None, params=None):
     headers = {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -34,7 +36,7 @@ def alpaca_request(method, endpoint, data=None):
     }
     url = f"{ALPACA_BASE_URL}{endpoint}"
     if method == "GET":
-        return requests.get(url, headers=headers).json()
+        return requests.get(url, headers=headers, params=params).json()
     elif method == "POST":
         return requests.post(url, headers=headers, json=data).json()
     elif method == "DELETE":
@@ -46,13 +48,31 @@ def get_account():
 def get_positions():
     return alpaca_request("GET", "/v2/positions")
 
+def get_open_orders():
+    return alpaca_request("GET", "/v2/orders", params={"status": "open"})
+
+def cancel_all_orders():
+    try:
+        alpaca_request("DELETE", "/v2/orders")
+        print("All open orders cancelled")
+    except Exception as e:
+        print(f"Cancel orders error: {e}")
+
+def liquidate_position(symbol):
+    try:
+        alpaca_request("DELETE", f"/v2/positions/{symbol}")
+        print(f"Liquidated {symbol}")
+    except Exception as e:
+        print(f"Liquidate error for {symbol}: {e}")
+
 def liquidate_all():
     positions = get_positions()
     if not isinstance(positions, list):
         return
     for pos in positions:
         symbol = pos["symbol"]
-        alpaca_request("DELETE", f"/v2/positions/{symbol}")
+        liquidate_position(symbol)
+    time.sleep(2)
 
 def submit_order(symbol, side, notional=None, qty=None):
     order = {
@@ -64,13 +84,34 @@ def submit_order(symbol, side, notional=None, qty=None):
     if notional:
         order["notional"] = str(round(notional, 2))
     elif qty:
-        order["qty"] = qty
+        order["qty"] = str(qty)
     return alpaca_request("POST", "/v2/orders", order)
+
+def is_market_hours():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+def get_current_holding():
+    try:
+        positions = get_positions()
+        if not isinstance(positions, list) or len(positions) == 0:
+            return SAFE, 0
+        pos = positions[0]
+        symbol = pos["symbol"]
+        market_value = float(pos.get("market_value", 0))
+        return symbol, market_value
+    except:
+        return SAFE, 0
 
 def keepalive():
     try:
         get_account()
-        print(f"Keepalive {datetime.utcnow().strftime('%H:%M:%S')}")
+        print(f"Keepalive {datetime.now(pytz.utc).strftime('%H:%M:%S')}")
     except:
         pass
 
@@ -92,7 +133,6 @@ def calc_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def score_assets():
-    global current_holding
     scores = {}
     prices = {}
 
@@ -105,10 +145,7 @@ def score_assets():
     except:
         spy_trend = True
 
-    all_tickers = TICKERS + [SAFE]
-    for ticker in all_tickers:
-        if ticker == SAFE:
-            continue
+    for ticker in TICKERS:
         try:
             df = yf.download(ticker, period="100d", interval="1d", progress=False)
             close = df["Close"].squeeze()
@@ -172,17 +209,15 @@ def calc_target_weight(ticker):
     except:
         return 1.0
 
-def execute_rotation(new_ticker, weight):
-    global current_holding
+def execute_rotation(new_ticker, weight, account_value):
     try:
-        account = get_account()
-        portfolio_value = float(account["portfolio_value"])
-        notional = portfolio_value * weight
-
+        cancel_all_orders()
+        time.sleep(1)
         liquidate_all()
-        time.sleep(2)
+        time.sleep(3)
 
         if new_ticker != SAFE:
+            notional = account_value * weight
             result = submit_order(new_ticker, "buy", notional=notional)
             order_id = result.get("id", "unknown")
             return f"ROTATED TO: {new_ticker}\nNotional: ${notional:,.0f} ({weight*100:.0f}% of portfolio)\nOrder ID: {order_id}"
@@ -192,11 +227,37 @@ def execute_rotation(new_ticker, weight):
         return f"Rotation failed: {e}"
 
 def run_cycle():
-    global current_holding
+    global current_holding, daily_initialized
+
+    if not is_market_hours():
+        print(f"Market closed. Sleeping. Current holding: {current_holding}")
+        brief = f"OMNISCIENTBOT\nTime: {datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M UTC')}\nMarket closed. Holding: {current_holding}\nNo action."
+        send_telegram(brief)
+        return
+
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
+    if now_et.hour == 9 and now_et.minute < 45 and not daily_initialized:
+        cancel_all_orders()
+        daily_initialized = True
+        print("Daily initialization -- stale orders cancelled")
+
+    if now_et.hour == 16:
+        daily_initialized = False
+
+    actual_holding, holding_value = get_current_holding()
+    current_holding = actual_holding
 
     best_ticker, best_score, spy_trend, scores, prices = score_assets()
 
+    try:
+        account = get_account()
+        portfolio_value = float(account.get("portfolio_value", 100000))
+    except:
+        portfolio_value = 100000
+
     should_rotate = False
+
     if current_holding == SAFE:
         if best_score > 0.02:
             should_rotate = True
@@ -214,27 +275,30 @@ def run_cycle():
     score_lines = "\n".join([f"  {t}: {s:.3f}" for t, s in sorted_scores])
 
     brief = f"OMNISCIENTBOT CYCLE\n"
-    brief += f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n"
-    brief += f"SPY Trend: {'BULL' if spy_trend else 'BEAR'}\n\n"
+    brief += f"Time: {datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+    brief += f"SPY Trend: {'BULL' if spy_trend else 'BEAR'}\n"
+    brief += f"Portfolio: ${portfolio_value:,.0f}\n\n"
     brief += f"SCORES:\n{score_lines}\n\n"
     brief += f"CURRENT HOLDING: {current_holding}\n"
     brief += f"WINNER: {best_ticker} (score: {best_score:.3f})\n"
 
     if should_rotate:
         weight = calc_target_weight(best_ticker) if best_ticker != SAFE else 1.0
-        result = execute_rotation(best_ticker, weight)
+        result = execute_rotation(best_ticker, weight, portfolio_value)
         current_holding = best_ticker
         brief += f"\nROTATION EXECUTED\n{result}"
+        send_telegram(brief)
+        print(f"Rotated to {best_ticker}")
     else:
         brief += f"\nACTION: HOLD {current_holding}"
-
-    send_telegram(brief)
-    print(brief)
+        send_telegram(brief)
+        print(f"Holding {current_holding}")
 
 while True:
     try:
         run_cycle()
     except Exception as e:
-        send_telegram(f"OmniscientBot error: {e}")
-        print(f"Error: {e}")
+        msg = f"OmniscientBot error: {e}"
+        send_telegram(msg)
+        print(msg)
     smart_sleep(900)
