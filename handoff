@@ -1,0 +1,84 @@
+Paste this as the entire file:
+
+```markdown
+# OmniscientBot -- System Handoff
+Last updated: May 12 2026
+
+## CRITICAL RULE -- LIVE PRICING ALWAYS
+Claude NEVER outputs prices. Claude outputs ONLY ticker and direction.
+All prices come from get_live_price() via yfinance.
+Entry = live price. Stop = 5% from live. Target = 15% from live.
+This is non-negotiable and must survive every future rewrite of any file in any system.
+
+## System Overview
+OmniscientBot runs TheOmniscientParadox momentum rotation strategy.
+Backtested 35,909% return from 2019 to 2026. 73.7% CAGR. Sharpe 1.34.
+Competing against YoniBot and The Misfits on a separate Alpaca paper account.
+
+## Railway Service
+- Repo: github.com/horant2/omniscient-scheduler
+- Account: OmniscientBot paper account (separate from Misfits)
+- Status: Online 24/7
+
+## Railway Variables
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+- TELEGRAM_PERFORMANCE_TOKEN
+- TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130)
+- ALPACA_API_KEY (OmniscientBot account)
+- ALPACA_SECRET_KEY (OmniscientBot account)
+
+## Strategy -- TheOmniscientParadox
+Pure systematic momentum rotation across 8 assets:
+SOXL, TECL, TQQQ, FAS, ERX, UUP, TMF, BIL (safe haven)
+
+Scoring per asset every cycle:
+- weighted_mom = (9d ROC x 0.5) + (21d ROC x 0.3) + (63d ROC x 0.2)
+- risk_adj_mom = weighted_mom / 21d realized volatility
+- trend_score = 1.0 if price above 50d SMA, else 0.5
+- rsi_penalty = 0.9 if RSI above 85 or below 30, else 1.0
+- final_score = risk_adj_mom x trend_score x rsi_penalty
+
+Rotation rules:
+- Rotate only if new winner beats current holding by more than 10%
+- If SPY below 200d SMA: favor UUP, move to BIL if all scores negative
+- If best score is zero or negative: move to BIL
+- Target weight = 0.80 / annualized volatility, capped at 1.0
+
+Execution rules:
+- Market hours only (9:30 AM to 4:00 PM ET, weekdays)
+- Cancel all stale orders at 9:30 AM daily
+- Read actual Alpaca positions before deciding to rotate
+- get_live_price() called before every execution -- never use stale or hallucinated prices
+- Liquidate current position before buying new one
+
+## Performance Messages
+Fires to performance channel on:
+- Every rotation (buy and sell)
+- Every hourly position report (every 4 cycles)
+
+Format includes net profit since inception every message.
+
+## Backtest Results (independent validation)
+Run backtest.py in yonibot-scheduler repo:
+- OmniscientBot: 35,909% total return
+- SPY benchmark: 228% total return
+- Misfits proxy: 775% total return
+
+Max drawdown: -71.5% (2022 Fed tightening cycle was worst period)
+Most common rotation target: UUP (dollar, 20% of rotations)
+Total rotations in 7 year backtest: 175
+
+## Known Risks
+- Leveraged ETF gap risk: TQQQ and SOXL can gap 20-30% overnight
+- 5% stop loss does not fully protect against intraday gaps
+- 71.5% max drawdown requires strong stomach
+- Bear markets cause severe drawdowns before rotation to safety
+
+## Competition
+OmniscientBot competes against YoniBot and The Misfits.
+Two weeks paper trading before live capital.
+Live capital plan: $25K per account, scale after 30 days of profitable live trading.
+```
+
+Commit it. Tell me when done.
