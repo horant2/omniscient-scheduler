@@ -14,10 +14,6 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 
-# CRITICAL: All prices come from get_live_price() via yfinance
-# Entry = live price always. Stop = 5% from live. Target = 15% from live.
-# Never hardcode or hallucinate prices. Ever.
-
 INCEPTION_VALUE = 100000
 TICKERS = ["SOXL", "TECL", "TQQQ", "FAS", "ERX", "UUP", "TMF"]
 SAFE = "BIL"
@@ -38,6 +34,7 @@ TICKER_NAMES = {
 current_holding = SAFE
 daily_initialized = False
 daily_start_value = None
+daily_summary_sent = False
 price_cache = {}
 price_cache_time = {}
 PRICE_CACHE_SECONDS = 60
@@ -77,6 +74,33 @@ def send_performance(message):
         except Exception as e:
             print(f"Performance send error: {e}")
         time.sleep(1)
+
+def format_daily_summary(current_ticker, portfolio_value, current_pnl, current_pnl_pct, best_ticker, best_score, scores, spy_trend):
+    ticker_name = TICKER_NAMES.get(current_ticker, current_ticker)
+    net_profit = portfolio_value - INCEPTION_VALUE
+    net_pct = net_profit / INCEPTION_VALUE * 100
+    profit_emoji = "📈" if net_profit >= 0 else "📉"
+    pnl_emoji = "📈" if current_pnl >= 0 else "📉"
+    live_price = get_live_price(current_ticker)
+    price_str = f"${live_price:.2f}" if live_price else "unavailable"
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    score_lines = "\n".join([f"  {TICKER_NAMES.get(t, t)}: {s:.3f}" for t, s in sorted_scores])
+    action = "HOLD" if current_ticker == best_ticker else f"WATCHING {best_ticker} ({best_score:.3f})"
+    return f"""☀️ OMNISCIENTBOT DAILY BRIEFING
+
+Holding: {ticker_name}
+Live price: {price_str}
+Position P&L: {pnl_emoji} {'+' if current_pnl >= 0 else ''}${current_pnl:,.0f} ({'+' if current_pnl_pct >= 0 else ''}{current_pnl_pct:.1f}%)
+
+{profit_emoji} Net since inception: {'+' if net_profit >= 0 else ''}${net_profit:,.0f} ({'+' if net_pct >= 0 else ''}{net_pct:.2f}%)
+
+Market: {'BULL -- SPY above 200-day' if spy_trend else 'BEAR -- SPY below 200-day'}
+Action: {action}
+
+All momentum scores:
+{score_lines}
+
+-- Satis House Consulting"""
 
 def format_rotation_alert(new_ticker, old_ticker, notional, weight, portfolio_value):
     ticker_name = TICKER_NAMES.get(new_ticker, new_ticker)
@@ -323,11 +347,11 @@ def execute_rotation(new_ticker, old_ticker, weight, account_value):
             result = submit_order(new_ticker, "buy", notional=notional)
             order_id = result.get("id", "unknown")
             msg = format_rotation_alert(new_ticker, old_ticker, notional, weight, account_value)
-            send_performance(msg)
+            send_telegram(msg)
             return f"Rotated to {new_ticker} at ${live_price:.2f} (live)", order_id
         else:
             msg = format_safe_alert(old_ticker, account_value)
-            send_performance(msg)
+            send_telegram(msg)
             return "Moved to cash", None
     except Exception as e:
         return f"Rotation failed: {e}", None
@@ -335,21 +359,24 @@ def execute_rotation(new_ticker, old_ticker, weight, account_value):
 cycle_count = 0
 
 def run_cycle():
-    global current_holding, daily_initialized, daily_start_value
+    global current_holding, daily_initialized, daily_start_value, daily_summary_sent, cycle_count
+
+    et = pytz.timezone("America/New_York")
+    now_et = datetime.now(et)
 
     if not is_market_hours():
         actual_holding, market_val, current_pnl, current_pnl_pct = get_current_position()
         current_holding = actual_holding
         print(f"Market closed. Holding: {current_holding}")
+        if now_et.hour >= 17:
+            daily_summary_sent = False
         return
-
-    et = pytz.timezone("America/New_York")
-    now_et = datetime.now(et)
 
     if now_et.hour == 9 and now_et.minute < 45 and not daily_initialized:
         cancel_all_orders()
         daily_initialized = True
         daily_start_value = None
+        daily_summary_sent = False
         print("Daily init -- stale orders cancelled")
 
     if now_et.hour == 16:
@@ -371,6 +398,13 @@ def run_cycle():
 
     best_ticker, best_score, spy_trend, scores, prices = score_assets()
 
+    # Daily 9 AM summary
+    if now_et.hour == 9 and now_et.minute >= 30 and not daily_summary_sent:
+        msg = format_daily_summary(current_holding, portfolio_value, current_pnl, current_pnl_pct, best_ticker, best_score, scores, spy_trend)
+        send_telegram(msg)
+        daily_summary_sent = True
+        print("Daily summary sent")
+
     should_rotate = False
     if current_holding == SAFE:
         if best_score > 0.02:
@@ -385,36 +419,18 @@ def run_cycle():
             best_ticker = SAFE
             should_rotate = True
 
-    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    score_lines = "\n".join([f"  {TICKER_NAMES.get(t, t)}: {s:.3f}" for t, s in sorted_scores])
-
     if should_rotate:
         weight = calc_target_weight(best_ticker) if best_ticker != SAFE else 1.0
         result, order_id = execute_rotation(best_ticker, current_holding, weight, portfolio_value)
         old_holding = current_holding
         current_holding = best_ticker
         print(f"Rotated from {old_holding} to {best_ticker}")
-
-        tech_brief = f"OMNISCIENTBOT ROTATION\n"
-        tech_brief += f"From: {old_holding} To: {best_ticker}\n"
-        tech_brief += f"Score: {best_score:.3f} | Weight: {weight*100:.0f}%\n"
-        tech_brief += f"SPY trend: {'BULL' if spy_trend else 'BEAR'}\n\n"
-        tech_brief += f"All scores:\n{score_lines}"
-        send_telegram(tech_brief)
-
     else:
-        global cycle_count
         cycle_count += 1
         if cycle_count % 4 == 0:
             msg = format_position_report(current_holding, portfolio_value, current_pnl, current_pnl_pct, daily_pnl_pct)
-            send_performance(msg)
-
-        tech_brief = f"OMNISCIENTBOT\n"
-        tech_brief += f"Holding: {TICKER_NAMES.get(current_holding, current_holding)}\n"
-        tech_brief += f"Score: {scores.get(current_holding, 0):.3f} | Best: {best_ticker} ({best_score:.3f})\n"
-        tech_brief += f"SPY: {'BULL' if spy_trend else 'BEAR'} | Action: HOLD"
-        send_telegram(tech_brief)
-        print(f"Holding {current_holding}")
+            send_telegram(msg)
+        print(f"Holding {current_holding} | Score: {scores.get(current_holding, 0):.3f} | Best: {best_ticker} ({best_score:.3f})")
 
 while True:
     try:
