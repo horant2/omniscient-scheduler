@@ -329,9 +329,10 @@ def run_cycle():
 # Startup message
 send_signal(
     f"✅ OmniscientBot running\n"
-    f"Holding: {TICKER_NAMES.get(current_holding, current_holding)}\n"
     f"Daily update at 3:45 PM ET.\n"
-    f"Rotation alerts fire instantly."
+    f"Rotation alerts fire instantly.\n\n"
+    f"Note: if market is closed, position shows as Cash until open. "
+    f"Your holding does not change overnight."
 )
 
 while True:
