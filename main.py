@@ -220,19 +220,20 @@ def execute_rotation(new_ticker, old_ticker, weight, account_value):
     except Exception as e:
         print(f"Rotation failed: {e}")
 
-cycle_count      = 0
-daily_open_price = None
+daily_decision_made = False
+daily_best_ticker   = None
 
 def run_cycle():
     global current_holding, daily_initialized, daily_start_value
     global eod_summary_sent, cycle_count, daily_open_price
+    global daily_decision_made, daily_best_ticker
 
     et     = pytz.timezone("America/New_York")
     now_et = datetime.now(et)
 
-    # Reset flags after market close
     if now_et.hour >= 17:
-        eod_summary_sent = False
+        eod_summary_sent   = False
+        daily_decision_made = False
 
     if not is_market_hours():
         symbol, _, _ = get_current_position()
@@ -240,14 +241,14 @@ def run_cycle():
         print(f"Market closed. Holding: {current_holding}")
         return
 
-    # Daily init at open
     if now_et.hour == 9 and now_et.minute < 45 and not daily_initialized:
         cancel_all_orders()
-        daily_initialized  = True
-        daily_start_value  = None
-        daily_open_price   = None
-        eod_summary_sent   = False
-        print("Daily init")
+        daily_initialized   = True
+        daily_start_value   = None
+        daily_open_price    = None
+        eod_summary_sent    = False
+        daily_decision_made = False
+        print("Daily init -- open price reset")
 
     if now_et.hour == 16:
         daily_initialized = False
@@ -264,67 +265,83 @@ def run_cycle():
     if daily_start_value is None:
         daily_start_value = portfolio_val
 
-    # Track opening price of current holding for daily % calc
     live_price = get_live_price(current_holding)
+
+    # Get today's actual open price from yfinance for accurate daily % calculation
     if daily_open_price is None and live_price:
-        daily_open_price = live_price
+        try:
+            today_data = yf.download(current_holding, period="1d", interval="1m", progress=False)
+            if not today_data.empty:
+                daily_open_price = float(today_data["Open"].iloc[0])
+                print(f"Daily open price from yfinance: {current_holding} @ ${daily_open_price:.2f}")
+        except:
+            daily_open_price = live_price
 
     daily_pct = 0.0
     if daily_open_price and live_price and daily_open_price > 0:
         daily_pct = (live_price - daily_open_price) / daily_open_price * 100
 
-    best_ticker, best_score, spy_trend, scores = score_assets()
+    # ── ONE DECISION PER DAY ──────────────────────────────────
+    # Score assets once at market open between 9:35 and 9:50 AM.
+    # Hold that decision all day. This matches the daily backtest cadence.
+    # The original strategy made one decision per day on daily closing prices.
+    # Running scoring every 15 minutes on intraday prices causes whipsawing.
+
+    if now_et.hour == 9 and 35 <= now_et.minute <= 50 and not daily_decision_made:
+        print("Running daily scoring decision...")
+        best_ticker, best_score, spy_trend, scores = score_assets()
+        daily_best_ticker   = best_ticker
+        daily_decision_made = True
+
+        # Send morning briefing
+        name   = TICKER_NAMES.get(current_holding, current_holding)
+        target = TICKER_NAMES.get(best_ticker, best_ticker)
+        emoji  = "📈" if pnl_pct >= 0 else "📉"
+
+        if current_holding == best_ticker:
+            action = f"HOLD {name}"
+        else:
+            action = f"ROTATE: Sell {name} / Buy {target}"
+
+        msg = (
+            f"☀️ MORNING SIGNAL\n\n"
+            f"Holding: {name}\n"
+            f"Action: {action}\n\n"
+            f"Market: {'BULL' if spy_trend else 'BEAR'}"
+        )
+        send_signal(msg)
+
+        # Execute rotation if needed
+        if current_holding != best_ticker:
+            weight = calc_target_weight(best_ticker) if best_ticker != SAFE else 1.0
+            execute_rotation(best_ticker, current_holding, weight, portfolio_val)
+            old_name  = TICKER_NAMES.get(current_holding, current_holding)
+            new_name  = TICKER_NAMES.get(best_ticker, best_ticker)
+            new_price = get_live_price(best_ticker)
+            price_str = f" at ${new_price:.2f}" if new_price else ""
+            send_signal(
+                f"🔴 SELL {old_name}\n"
+                f"🟢 BUY {new_name}{price_str}\n\n"
+                f"Momentum rotated. Make the switch."
+            )
+            daily_open_price = None
+            current_holding  = best_ticker
+            print(f"Rotated to {best_ticker}")
 
     # End of day summary at 3:45 PM ET
     if now_et.hour == 15 and now_et.minute >= 45 and not eod_summary_sent:
-        name   = TICKER_NAMES.get(current_holding, current_holding)
-        emoji  = "📈" if daily_pct >= 0 else "📉"
-        action = "HOLD tomorrow" if current_holding == best_ticker else f"ROTATE to {TICKER_NAMES.get(best_ticker, best_ticker)}"
-        msg = (
+        name  = TICKER_NAMES.get(current_holding, current_holding)
+        emoji = "📈" if daily_pct >= 0 else "📉"
+        msg   = (
             f"{emoji} {name}\n"
-            f"Today: {daily_pct:+.2f}%\n\n"
-            f"Tomorrow: {action}"
+            f"Today: {daily_pct:+.2f}%"
         )
         send_signal(msg)
         eod_summary_sent = True
         print("EOD summary sent")
 
-    # Rotation check
-    should_rotate = False
-    if current_holding == SAFE:
-        if best_score > 0.02:
-            should_rotate = True
-    elif current_holding != best_ticker:
-        current_score = scores.get(current_holding, -999)
-        if best_score > current_score * (1 + CONFIDENCE_THRESHOLD):
-            should_rotate = True
-        elif current_score < -0.02:
-            best_ticker   = SAFE
-            should_rotate = True
-
-    if should_rotate:
-        old_name = TICKER_NAMES.get(current_holding, current_holding)
-        new_name = TICKER_NAMES.get(best_ticker, best_ticker)
-        weight   = calc_target_weight(best_ticker) if best_ticker != SAFE else 1.0
-        execute_rotation(best_ticker, current_holding, weight, portfolio_val)
-
-        if best_ticker == SAFE:
-            msg = f"🔴 SELL {old_name}\nMove to cash. Momentum gone."
-        else:
-            new_price = get_live_price(best_ticker)
-            price_str = f" at ${new_price:.2f}" if new_price else ""
-            msg = (
-                f"🔴 SELL {old_name}\n"
-                f"🟢 BUY {new_name}{price_str}\n\n"
-                f"Momentum rotated. Make the switch."
-            )
-        send_signal(msg)
-        daily_open_price = None
-        current_holding  = best_ticker
-        print(f"Rotated to {best_ticker}")
-
     cycle_count += 1
-    print(f"Holding {current_holding} | Best: {best_ticker} | Score: {best_score:.3f}")
+    print(f"Holding {current_holding} | Decision made today: {daily_decision_made}")
 
 # Startup message
 send_signal(
