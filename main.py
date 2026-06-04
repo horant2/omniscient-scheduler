@@ -311,19 +311,22 @@ def run_cycle():
     except:
         portfolio_val = INCEPTION_VALUE
 
-    # Capture today's open price for daily % calculation
-    live_price = get_live_price(current_holding) if current_holding and current_holding != SAFE else None
-    if daily_open_price is None and live_price and now_et.hour == 9 and now_et.minute >= 30:
-        try:
-            today_data = yf.download(current_holding, period="1d", interval="1m", progress=False)
-            if not today_data.empty:
-                daily_open_price = float(today_data["Open"].iloc[0])
-        except:
-            daily_open_price = live_price
-
+    # Get accurate daily return using fast_info
+    # fast_info.last_price = current live price
+    # fast_info.previous_close = confirmed previous session close
+    # This is the only reliable method at 3:55 PM before daily bars are finalized
     daily_pct = 0.0
-    if daily_open_price and live_price and daily_open_price > 0:
-        daily_pct = (live_price - daily_open_price) / daily_open_price * 100
+    if current_holding and current_holding != SAFE:
+        try:
+            ticker_obj     = yf.Ticker(current_holding)
+            fast           = ticker_obj.fast_info
+            last_price     = float(fast.last_price)
+            previous_close = float(fast.previous_close)
+            if previous_close and previous_close > 0:
+                daily_pct = (last_price - previous_close) / previous_close * 100
+            print(f"Daily pct: {current_holding} last={last_price:.2f} prev_close={previous_close:.2f} chg={daily_pct:.2f}%")
+        except Exception as e:
+            print(f"Daily pct error: {e}")
 
     # ── NAITIK'S SCHEDULE: rebalance 5 minutes before close ──
     # Original: self.time_rules.before_market_close(symbol, 5)
