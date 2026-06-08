@@ -383,8 +383,8 @@ def run_cycle():
 
 send_signal(
     f"✅ OmniscientBot running (Naitik Gupta v2.0.1)\n"
-    f"Rebalances daily at 3:55 PM ET.\n"
-    f"Daily update and rotation alerts at close.\n\n"
+    f"Signal fires daily at 2:30 PM Central / 3:30 PM Eastern.\n"
+    f"You have 30 minutes to execute before market close.\n\n"
     f"Note: position shows as Cash when market is closed. "
     f"Your holding does not change overnight."
 )
