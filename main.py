@@ -328,11 +328,10 @@ def run_cycle():
         except Exception as e:
             print(f"Daily pct error: {e}")
 
-    # ── NAITIK'S SCHEDULE: rebalance 5 minutes before close ──
-    # Original: self.time_rules.before_market_close(symbol, 5)
-    # = 3:55 PM ET
-
-    is_rebalance_window = (now_et.hour == 15 and now_et.minute >= 52)
+    # Signal fires at 3:30 PM ET (2:30 PM Central)
+    # Gives copy trader 30 minutes to execute before 4:00 PM ET close
+    # Naitik's original is 3:55 PM ET but that leaves only 4 minutes for manual execution
+    is_rebalance_window = (now_et.hour == 15 and 28 <= now_et.minute <= 35)
 
     if is_rebalance_window and not daily_rebalanced:
         print("Running Naitik's daily rebalance (5 min before close)...")
